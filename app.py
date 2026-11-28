@@ -4,7 +4,13 @@ from __future__ import annotations
 import hashlib
 import html
 import io
+import csv
 import math
+import sqlite3, json, uuid
+import folium
+from folium.plugins import Draw
+from streamlit_folium import st_folium
+from sampling import plan
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -94,6 +100,13 @@ def page_header(kicker, title, description):
     st.markdown(f'<div class="c-pagehead"><div class="c-eyebrow">{html.escape(kicker)}</div><h1>{html.escape(title)}</h1><p>{html.escape(description)}</p></div>', unsafe_allow_html=True)
 
 
+@st.dialog('Metode dan rujukan', width='large')
+def method_dialog():
+    st.write('Grid sistematis dengan titik awal acak dalam polygon. Interval 20 m adalah default operasional, bukan standar ilmiah. Titik adalah lokasi rekomendasi, bukan pohon terverifikasi.')
+    st.markdown('[Stehman & Foody (2019), Key issues in rigorous accuracy assessment of land cover products](https://doi.org/10.1016/j.rse.2019.05.018) — konteks desain sampling spasial, bukan validasi kakao.')
+    st.markdown('[Selvaraju et al. (2017), Grad-CAM](https://doi.org/10.1109/ICCV.2017.74) — interpretasi model visual.')
+    st.markdown('[Marelli et al. (2019), Chocolate Under Threat from Old and New Cacao Diseases](https://doi.org/10.1094/PHYTO-12-18-0477-RVW) — konteks penyakit kakao.')
+
 def source_links(group):
     cards = []
     for ref in REFERENCES[group]:
@@ -108,60 +121,6 @@ def source_links(group):
             <div class="cn-reference-bottom">BACA SUMBER <span>↗</span></div>
         </a>''')
     st.markdown('<div class="cn-reference-grid">'+''.join(cards)+'</div>', unsafe_allow_html=True)
-
-
-def field_grid(area_ha: float, width_m: float, cell_m: float, row_space: float, tree_space: float, fruits: int):
-    area = area_ha * 10000.0
-    length = area / width_m
-    nx = max(1, math.ceil(width_m / cell_m))
-    ny = max(1, math.ceil(length / cell_m))
-    if nx * ny > 1500:
-        raise ValueError('Terlalu banyak petak. Perbesar ukuran petak atau periksa luas dan lebar kebun.')
-    data = []
-    idx = 0
-    for row in range(ny):
-        cols = range(nx) if row % 2 == 0 else range(nx-1, -1, -1)
-        for col in cols:
-            idx += 1
-            x0 = col * cell_m
-            y0 = row * cell_m
-            x1 = min((col+1)*cell_m, width_m)
-            y1 = min((row+1)*cell_m, length)
-            # Choose nearest nominal tree to cell center (tree at half-spacing positions).
-            target_x = (x0+x1)/2
-            target_y = (y0+y1)/2
-            xx = (round((target_x - tree_space/2)/tree_space) + .5) * tree_space
-            yy = (round((target_y - row_space/2)/row_space) + .5) * row_space
-            xx = min(max(xx, x0), x1)
-            yy = min(max(yy, y0), y1)
-            data.append({'Titik': f'S-{idx:03d}', 'Baris petak': row+1, 'Kolom petak': col+1,
-                         'X dari sisi kiri (m)': round(xx, 1), 'Y dari sisi bawah (m)': round(yy, 1),
-                         'Buah disarankan': fruits})
-    return pd.DataFrame(data), length, nx, ny
-
-
-def grid_figure(data, width, length, cell):
-    fig, ax = plt.subplots(figsize=(min(11, max(6, width/12)), min(8, max(4, length/14))))
-    fig.patch.set_facecolor('#F6F5EC')
-    ax.set_facecolor('#E8EBD7')
-    nx = math.ceil(width/cell)
-    ny = math.ceil(length/cell)
-    for j in range(ny):
-        for i in range(nx):
-            x=i*cell; y=j*cell
-            ax.add_patch(Rectangle((x,y),min(cell,width-x),min(cell,length-y),
-                         facecolor=('#D9E8B9' if (i+j)%2==0 else '#E8EBD5'),edgecolor='#91A67E',linewidth=.8))
-    xs=data['X dari sisi kiri (m)'].tolist(); ys=data['Y dari sisi bawah (m)'].tolist()
-    ax.scatter(xs, ys, s=35, c='#F06C4E',edgecolors='white',linewidths=.8,zorder=3)
-    if len(data)<=70:
-        for idx,(x,y) in enumerate(zip(xs,ys)):
-            ax.annotate(str(idx+1),(x,y),xytext=(3,3),textcoords='offset points',fontsize=6,color='#1F3426')
-    ax.set_xlim(0,width);ax.set_ylim(0,length);ax.set_aspect('equal',adjustable='box')
-    ax.set_xlabel('Lebar kebun (meter)');ax.set_ylabel('Panjang kebun (meter)')
-    ax.set_title('Rencana sampling · satu pohon contoh per petak',fontsize=11,fontweight='bold',color='#1F3426',pad=12)
-    ax.grid(False)
-    fig.tight_layout()
-    return fig
 
 
 # Native Streamlit controls remain functional; the custom skin is applied only to presentation.
@@ -210,7 +169,7 @@ def render_topbar(requested: str, model_ready: bool):
     )
 
 # Query-string navigation makes the hero CTA and cards real links.
-ROUTES = {'home': 'Beranda', 'scan': 'Scan Kakao', 'sampling': 'Rencana Sampling', 'guide': 'Panduan Penanganan', 'settings': 'Pengaturan'}
+ROUTES = {'home': 'Beranda', 'scan': 'Scan Kakao', 'sampling': 'Rencana Sampling', 'monitor': 'Monitoring', 'guide': 'Panduan Penanganan', 'settings': 'Pengaturan'}
 requested = st.query_params.get('page', 'home')
 if requested not in ROUTES:
     requested = 'home'
@@ -221,6 +180,23 @@ render_topbar(requested, model_ready)
 
 rows = all_records()
 counts = {key:sum(r[2] == key for r in rows) for key in CLASS_NAMES}
+
+(ROOT/'data').mkdir(exist_ok=True)
+def db():
+    c=sqlite3.connect(ROOT/'data'/'spatial.db');c.execute('CREATE TABLE IF NOT EXISTS plans(id TEXT PRIMARY KEY,name TEXT,data TEXT)');c.execute('CREATE TABLE IF NOT EXISTS scans(id TEXT PRIMARY KEY,plan_id TEXT,point TEXT,fruit TEXT,period TEXT,label TEXT,score REAL, UNIQUE(plan_id,point,fruit,period))');c.execute('CREATE TABLE IF NOT EXISTS visits(plan_id TEXT, point TEXT, period TEXT, note TEXT, PRIMARY KEY(plan_id,point,period))');c.commit();return c
+with db() as c: plans={i:(n,json.loads(d)) for i,n,d in c.execute('SELECT id,name,data FROM plans')}
+def basemap(center=(-2.5,118),zoom=5):
+    m=folium.Map(location=center,zoom_start=zoom,tiles=None,control_scale=True)
+    folium.TileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',attr='&copy; OpenStreetMap contributors',name='Peta jalan Indonesia',max_zoom=19,show=True).add_to(m)
+    folium.TileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',attr='Esri, Maxar, Earthstar Geographics and GIS community',name='Satelit',overlay=False,show=False,max_zoom=19).add_to(m);folium.LayerControl().add_to(m);return m
+def layers(m,p,colors=None):
+    folium.Polygon(p['vertices'],color='#276749',fill=True,fill_opacity=.10).add_to(m)
+    for x in p['points']:
+        folium.CircleMarker([x['lat'],x['lon']],radius=6,popup=folium.Popup(f"<b>{x['code']}</b><br>{x['lat']:.6f}, {x['lon']:.6f}",max_width=240),color= (colors or {}).get(x['code'],'#d49b33'),fill=True,fill_opacity=.9,tooltip=x['code']).add_to(m)
+    m.fit_bounds(p['vertices'])
+def choose():
+    if not plans: st.info('Simpan rancangan sampling terlebih dahulu.');return None
+    return st.selectbox('Rencana kebun',list(plans),format_func=lambda k:plans[k][0]+' · '+k[:6])
 
 if page == 'Beranda':
     st.markdown('''<section class="cn-hero">
@@ -240,7 +216,7 @@ if page == 'Beranda':
     <div class="cn-section-intro"><span>01 / EXPLORE THE PLATFORM</span><h2>Everything your field needs.<br><em>Nothing it doesn't.</em></h2></div>
     <div class="cn-feature-grid">
       <a href="?page=scan" class="cn-feature cn-feature-one"><div class="cn-feature-art cn-art-one"></div><div class="cn-feature-icon">◎</div><div class="cn-feature-content"><span>01 — AI DIAGNOSIS</span><h3>Scan Kakao</h3><p>Foto atau kamera langsung. Kenali tiga kondisi buah dan lihat Grad-CAM.</p></div><span class="cn-feature-arrow">↗</span></a>
-      <a href="?page=sampling" class="cn-feature cn-feature-two"><div class="cn-feature-art cn-art-two"></div><div class="cn-feature-icon">▦</div><div class="cn-feature-content"><span>02 — FIELD PLANNING</span><h3>Rencana Sampling</h3><p>Ubah luas dan jarak tanam menjadi rekomendasi petak dan pohon contoh.</p></div><span class="cn-feature-arrow">↗</span></a>
+      <a href="?page=sampling" class="cn-feature cn-feature-two"><div class="cn-feature-art cn-art-two"></div><div class="cn-feature-icon">▦</div><div class="cn-feature-content"><span>02 — FIELD PLANNING</span><h3>Rencana Sampling</h3><p>Gambar batas kebun dan buat titik pengamatan pada peta geografis.</p></div><span class="cn-feature-arrow">↗</span></a>
       <a href="?page=guide" class="cn-feature cn-feature-three"><div class="cn-feature-art cn-art-three"></div><div class="cn-feature-icon">✳</div><div class="cn-feature-content"><span>03 — FIELD GUIDANCE</span><h3>Panduan Penanganan</h3><p>Langkah awal menghadapi penyakit, beserta rujukan teknis pertanian.</p></div><span class="cn-feature-arrow">↗</span></a>
     </div>''',unsafe_allow_html=True)
     st.markdown('<div class="cn-stat-heading">FIELD NOTES <span>MONITORING SNAPSHOT / LIVE LOCAL DATA</span></div>',unsafe_allow_html=True)
@@ -314,53 +290,131 @@ elif page == 'Scan Kakao':
                 except Exception as exc:st.warning('Grad-CAM belum kompatibel dengan model ini: '+str(exc))
             cam=st.session_state.get('last_cam')
             if cam and cam[0]==key:st.image(cam[1],caption='Grad-CAM — area yang memengaruhi keputusan AI, bukan bukti lokasi penyakit',use_container_width=True)
+            linked=st.selectbox('Kebun (opsional)',[None]+list(plans),format_func=lambda k: plans[k][0] if k else 'Pemeriksaan bebas')
+            if linked:
+                point=st.selectbox('Titik sampling',[x['code'] for x in plans[linked][1]['points']]); period=st.date_input('Tanggal pengamatan'); fruit=st.text_input('ID buah unik')
             note=st.text_input('Kode pohon / catatan (opsional)',placeholder='Contoh: Petak B-03, Pohon S-014')
             if st.button('Simpan hasil pemeriksaan',type='primary',use_container_width=True):
-                save(lab,probs[lab],notes=note)
+                if linked:
+                    if not fruit.strip(): st.error('Isi ID buah.'); st.stop()
+                    try:
+                        with db() as c: c.execute('INSERT INTO scans VALUES(?,?,?,?,?,?,?)',(uuid.uuid4().hex,linked,point,fruit.strip(),str(period),lab,probs[lab]))
+                    except sqlite3.IntegrityError: st.error('Buah sudah dicatat pada titik dan tanggal ini.'); st.stop()
+                    xy=next(x for x in plans[linked][1]['points'] if x['code']==point)
+                    save(lab,probs[lab],xy['lat'],xy['lon'],note)
+                else: save(lab,probs[lab],notes=note)
                 st.success('Pemeriksaan tersimpan.');st.rerun()
         else:
             st.markdown('<div class="c-card"><b>Siap untuk diagnosis.</b><p>Unggah atau ambil satu foto, lalu klik Analisis. Hasil, rekomendasi awal, dan opsi Grad-CAM akan ditampilkan di sini.</p></div>',unsafe_allow_html=True)
     st.caption('Kamera pada Streamlit mengambil foto statis saat tombol ditekan; belum berupa deteksi video real-time frame demi frame.')
 
 elif page == 'Rencana Sampling':
-    page_header('02 / SMART SAMPLING', 'Satu kebun. Banyak petak. Lebih efisien.', 'Buat rancangan pemeriksaan berbasis luas kebun, bentuk lahan, jarak antarpohon, dan ukuran petak sampling. Tanpa memasukkan koordinat GPS.')
-    st.markdown('<div class="c-card c-yellow"><b>Bagaimana sistem ini bekerja?</b><p>Satu titik rekomendasi menunjukkan satu pohon contoh pada setiap petak. Jumlah petak dapat kamu ubah dengan mengatur ukuran grid. Ini strategi sampling operasional awal, bukan perhitungan ukuran sampel statistik atau aturan resmi untuk semua kebun.</p></div>',unsafe_allow_html=True)
-    col1,col2,col3=st.columns(3,gap='medium')
-    with col1:
-        area=st.number_input('Luas kebun (hektare)',min_value=.01,max_value=100.0,value=1.0,step=.25,format='%.2f')
-        width=st.number_input('Perkiraan lebar kebun (meter)',min_value=5.0,max_value=10000.0,value=100.0,step=5.0)
-    with col2:
-        tree_space=st.number_input('Jarak antarpohon (meter)',min_value=1.0,max_value=20.0,value=3.0,step=.5)
-        row_space=st.number_input('Jarak antarbaris (meter)',min_value=1.0,max_value=20.0,value=3.0,step=.5)
-    with col3:
-        cell=st.slider('Ukuran petak sampling (meter)',min_value=10,max_value=100,value=20,step=5,help='Misalnya 20 berarti petak 20 × 20 meter; satu pohon contoh tiap petak.')
-        fruits=st.select_slider('Buah diamati pada tiap pohon contoh',options=[1,2,3,4,5],value=2)
-    try:
-        data,length,nx,ny=field_grid(area,width,cell,row_space,tree_space,fruits)
-        n=len(data)
-        approx_trees=math.floor(area*10000/(tree_space*row_space))
-        metrics=st.columns(4)
-        metrics[0].metric('Jumlah petak',f'{n:,}'.replace(',','.'))
-        metrics[1].metric('Pohon contoh',f'{n:,}'.replace(',','.'))
-        metrics[2].metric('Buah diperiksa',f'{n*fruits:,}'.replace(',','.'))
-        metrics[3].metric('Estimasi pohon kebun',f'{approx_trees:,}'.replace(',','.'))
-        st.caption(f'Perkiraan panjang kebun: {length:.1f} m · grid {nx} kolom × {ny} baris · estimasi jumlah pohon memakai jarak tanam teoritis, tidak memperhitungkan jalan dan ruang kosong.')
-        left,right=st.columns([1.35,1],gap='large')
-        with left:
-            st.markdown('<div class="c-section">Denah sampling</div>',unsafe_allow_html=True)
-            fig=grid_figure(data,width,length,cell)
-            st.pyplot(fig,use_container_width=True)
-            buf=io.BytesIO();fig.savefig(buf,format='png',dpi=165,bbox_inches='tight');plt.close(fig)
-            st.download_button('Download denah PNG',buf.getvalue(),'cacaonex_denah_sampling.png','image/png',use_container_width=True)
-        with right:
-            st.markdown('<div class="c-section">Daftar titik sampel</div>',unsafe_allow_html=True)
-            st.dataframe(data,height=410,use_container_width=True,hide_index=True)
-            st.download_button('Download titik sampling CSV',data.to_csv(index=False).encode('utf-8-sig'),'cacaonex_titik_sampling.csv','text/csv',use_container_width=True)
-        st.markdown('<div class="c-card c-pink"><b>Cara pakai di kebun</b><p>Mulai dari petak S-001, cari pohon terdekat dengan posisi rekomendasi, lalu pilih buah dari bagian tajuk yang berbeda. Catat pohon yang tidak berbuah, gejala terlihat, dan kondisi petak. Jika ditemukan gejala, periksa pohon tetangga dan perluas pengamatan. Koordinat X–Y hanya jarak lokal dari sudut kebun, bukan koordinat geografis.</p></div>',unsafe_allow_html=True)
-        st.warning('Jangan gunakan hasil satu buah untuk menghitung prevalensi penyakit satu hektare. Untuk penelitian epidemiologi, jumlah pohon/buah, pemilihan acak, pengelompokan area, dan pengulangan waktu perlu protokol sampling tervalidasi.')
-        st.markdown('**Bacaan mengenai sampling lapangan:**')
-        source_links('umum')
-    except ValueError as exc:st.error(str(exc))
+    page_header('02 / FIELD MAPPING','Rencana sampling kebun','Gambar batas kebun pada peta Indonesia, lalu buat titik pengamatan tetap.');st.caption('Peta Indonesia • pilih lapisan satelit melalui ikon layer di kanan atas. Gambar polygon batas kebun dengan alat di kiri peta.')
+    if st.button('ⓘ Metode dan referensi'): method_dialog()
+    left,right=st.columns([3,1]);
+    with right:
+        name=st.text_input('Nama kebun','Kebun kakao');spacing=st.number_input('Interval titik (meter)',2,1000,20);seed=st.number_input('Random seed',0,2147483647,42);st.caption('20 m hanyalah nilai awal yang dapat diubah, bukan standar ilmiah. Jumlah titik muncul dari luas dan interval.')
+        if st.button('Kembali ke Indonesia'):
+            st.session_state.map_center=(-2.5,118);st.session_state.map_zoom=5;st.session_state.pop('boundary',None);st.session_state.pop('draft',None);st.session_state['maprev']=st.session_state.get('maprev',0)+1;st.rerun()
+        if st.button('Reset batas'): st.session_state.pop('boundary',None);st.session_state.pop('draft',None);st.session_state['maprev']=st.session_state.get('maprev',0)+1;st.rerun()
+    with left:
+        m=basemap(center=st.session_state.get('map_center',(-2.5,118)),zoom=st.session_state.get('map_zoom',5));Draw(export=False,draw_options={'polygon':True,'rectangle':False,'polyline':False,'circle':False,'circlemarker':False,'marker':False},edit_options={'edit':False,'remove':False}).add_to(m)
+        if st.session_state.get('draft'): layers(m,st.session_state.draft)
+        elif st.session_state.get('boundary'): folium.Polygon(st.session_state.boundary,color='green').add_to(m);m.fit_bounds(st.session_state.boundary)
+        result=st_folium(m,height=650,use_container_width=True,key='draw'+str(st.session_state.get('maprev',0)),returned_objects=['last_active_drawing','center','zoom'])
+        if result and result.get('center'):
+            st.session_state.map_center=[result['center']['lat'],result['center']['lng']]
+            st.session_state.map_zoom=result.get('zoom') or 5
+        g=(result or {}).get('last_active_drawing') or {};g=g.get('geometry',{})
+        if g.get('type')=='Polygon':
+            v=[[lat,lon] for lon,lat in g['coordinates'][0][:-1]]
+            if v!=st.session_state.get('boundary'): st.session_state.boundary=v;st.session_state.pop('draft',None)
+        with st.expander('Alternatif jika menggambar tidak tersedia'):
+            txt=st.text_area('Koordinat batas: satu latitude,longitude per baris')
+            if st.button('Gunakan koordinat'):
+                try: st.session_state.boundary=[list(map(float,t.split(','))) for t in txt.splitlines() if t.strip()];st.session_state.pop('draft',None);st.session_state['maprev']=st.session_state.get('maprev',0)+1;st.rerun()
+                except ValueError: st.error('Format koordinat tidak valid.')
+    if st.button('Buat titik sampling',type='primary'):
+        try:
+            p=plan(st.session_state.get('boundary',[]),spacing,seed)
+            if not p['points']: raise ValueError('Tidak ada titik. Kurangi interval.')
+            st.session_state.draft=p;st.session_state['maprev']=st.session_state.get('maprev',0)+1;st.rerun()
+        except ValueError as e: st.error(str(e))
+    if st.session_state.get('draft'):
+        p=st.session_state.draft;a,b,c=st.columns(3);a.metric('Luas (ha)',f"{p['area']/10000:.3f}");b.metric('Titik sampling',len(p['points']));c.metric('Interval (m)',p['spacing']);st.dataframe(p['points'],use_container_width=True)
+        buf=io.StringIO();w=csv.DictWriter(buf,fieldnames=['code','lat','lon'],extrasaction='ignore');w.writeheader();w.writerows(p['points']);st.download_button('Unduh CSV',buf.getvalue(),'sampling.csv')
+        if st.button('Simpan rencana tetap'):
+            with db() as c: c.execute('INSERT INTO plans VALUES(?,?,?)',(uuid.uuid4().hex,name,json.dumps(p)))
+            st.success('Rencana tersimpan. Gunakan titik ini untuk monitoring berikutnya.')
+
+elif page == 'Monitoring':
+    page_header('03 / FIELD ANALYSIS','Monitoring kebun','Pilih titik, catat kunjungan, dan periksa buah langsung dari monitoring.')
+    k=choose()
+    if k:
+        p=plans[k][1]
+        period=str(st.date_input('Tanggal pengamatan',key='monitor_date'))
+        codes=[x['code'] for x in p['points']]
+        with db() as c:
+            df=pd.read_sql_query('SELECT point,fruit,period,label,score FROM scans WHERE plan_id=? AND period=?',c,params=(k,period))
+            visits=dict(c.execute('SELECT point,note FROM visits WHERE plan_id=? AND period=?',(k,period)))
+        scanned=set(df.point); done=set(visits)|scanned
+        a,b,c=st.columns(3);a.metric('Total titik',len(codes));b.metric('Sudah dikunjungi',len(done));c.metric('Belum dikunjungi',len(set(codes)-done))
+        st.progress(len(done)/max(1,len(codes)))
+        colors={x:'#3979a8' for x in visits}
+        colors.update({i:('#c35c43' if (g.label!='healthy').any() else '#39905d') for i,g in df.groupby('point')})
+        m=basemap();layers(m,p,colors);st_folium(m,height=450,use_container_width=True,returned_objects=[],key='monitor_map_'+k+period+str(sorted(colors.items())))
+        st.caption('Oranye: belum dikunjungi. Biru: kunjungan manual tanpa scan. Hijau: semua prediksi sehat. Merah: ada prediksi serangan.')
+        table=pd.DataFrame([{'Kode':x,'Dikunjungi':x in done,'Jumlah scan':int((df.point==x).sum()),'Catatan':visits.get(x,'')} for x in codes])
+        st.dataframe(table,hide_index=True,use_container_width=True)
+        point=st.selectbox('Titik aktif',codes,key='monitor_point_'+k)
+        tag=k+period+point
+        with st.form('visit_'+tag):
+            checked=st.checkbox('Tandai kunjungan manual',value=point in visits)
+            note=st.text_area('Catatan lapangan',value=visits.get(point,''))
+            if st.form_submit_button('Simpan checklist'):
+                with db() as c:
+                    if checked: c.execute('INSERT OR REPLACE INTO visits VALUES(?,?,?,?)',(k,point,period,note))
+                    else: c.execute('DELETE FROM visits WHERE plan_id=? AND point=? AND period=?',(k,point,period))
+                st.rerun()
+        st.caption('Titik dengan hasil scan tetap tercatat dikunjungi meskipun checklist manual dihapus.')
+        with st.expander('Deteksi AI dan Grad-CAM pada titik '+point,expanded=True):
+            model,error=fetch_model()
+            if model is None: st.warning('Pasang model pada Pengaturan. '+(error or ''))
+            source=st.radio('Sumber foto',['Unggah','Kamera'],horizontal=True,key='src_'+tag)
+            upload=st.file_uploader('Foto buah',type=['jpg','jpeg','png'],key='up_'+tag) if source=='Unggah' else st.camera_input('Foto buah',key='cam_'+tag)
+            fruit=st.text_input('ID buah unik',key='fruit_'+tag)
+            if upload is not None:
+                try:
+                    raw=upload.getvalue(); photo=Image.open(io.BytesIO(raw)).convert('RGB'); digest=hashlib.sha256(raw).hexdigest(); resultkey=tag+digest
+                    st.image(photo,width=250)
+                    if st.button('Analisis buah',disabled=model is None,key='an_'+tag):
+                        lab,probs=predict(model,photo);st.session_state['monitor_result']=(resultkey,lab,probs);st.session_state.pop('monitor_cam',None)
+                    r=st.session_state.get('monitor_result')
+                    if r and r[0]==resultkey:
+                        _,lab,probs=r;st.write(f'{LABELS[lab]} — skor {probs[lab]:.1%}')
+                        if st.button('Grad-CAM',disabled=model is None,key='gc_'+tag):
+                            st.session_state['monitor_cam']=(resultkey,overlay(photo,gradcam(model,photo)))
+                        cam=st.session_state.get('monitor_cam')
+                        if cam and cam[0]==resultkey: st.image(cam[1],caption='Grad-CAM: area yang memengaruhi prediksi')
+                        if st.button('Simpan hasil ke titik '+point,key='sv_'+tag):
+                            if not fruit.strip(): st.error('Isi ID buah unik.')
+                            else:
+                                try:
+                                    with db() as c: c.execute('INSERT INTO scans VALUES(?,?,?,?,?,?,?)',(uuid.uuid4().hex,k,point,fruit.strip(),period,lab,float(probs[lab])))
+                                except sqlite3.IntegrityError: st.error('ID buah sudah tercatat pada titik dan tanggal ini.')
+                                else:
+                                    xy=next(x for x in p['points'] if x['code']==point)
+                                    save(lab,probs[lab],xy['lat'],xy['lon'],note)
+                                    st.session_state.pop('monitor_result',None);st.rerun()
+                except Exception as exc: st.error('Pemeriksaan gagal: '+str(exc))
+        st.subheader('Analisis tanggal pengamatan')
+        if not df.empty:
+            a,b=st.columns(2);a.metric('Buah diperiksa',len(df));b.metric('Proporsi prediksi terserang',f"{(df.label!='healthy').mean():.1%}")
+            st.bar_chart(df.label.value_counts().rename(index=LABELS));st.dataframe(df,use_container_width=True)
+            st.download_button('Unduh hasil scan',df.to_csv(index=False),'monitoring.csv')
+        else: st.info('Belum ada hasil scan pada tanggal ini.')
+        st.download_button('Unduh checklist',table.to_csv(index=False),'checklist.csv')
+        st.caption('Proporsi dihitung dari buah yang dipindai, bukan estimasi prevalensi seluruh kebun.')
 
 elif page == 'Panduan Penanganan':
     page_header('03 / FIELD GUIDE', 'Tindakan yang tepat, bukan sekadar prediksi.', 'Panduan tindakan awal untuk tiga keluaran model CACAONEX. Setiap kategori dilengkapi sumber Kementerian Pertanian yang bisa diperiksa langsung.')
@@ -370,7 +424,7 @@ elif page == 'Panduan Penanganan':
     st.markdown(f'<div class="c-card"><div class="c-eyebrow">REKOMENDASI TERARAH</div><h2>{html.escape(title)}</h2><p>Gunakan tindakan berikut sebagai pedoman awal yang tetap perlu disesuaikan dengan pemeriksaan lapangan.</p></div>',unsafe_allow_html=True)
     for i,action in enumerate(actions,1):
         st.markdown(f'<div class="c-card"><span class="c-step">{i:02d}</span><b>{html.escape(action)}</b></div>',unsafe_allow_html=True)
-    st.markdown('<div class="cn-references-heading"><div><span>LIBRARY / VERIFIED SOURCES</span><h2>Rujukan pilihan untuk penanganan yang lebih tepat.</h2></div><p>Dokumen teknis pemerintah dan artikel ilmiah yang dapat ditelusuri langsung.</p></div>',unsafe_allow_html=True)
+    st.markdown('<div class="cn-references-heading"><div><span>LIBRARY / REFERENCES</span><h2>Rujukan pilihan untuk penanganan yang lebih tepat.</h2></div><p>Dokumen teknis pemerintah dan artikel ilmiah yang dapat ditelusuri langsung.</p></div>',unsafe_allow_html=True)
     source_links(refs)
     st.markdown('<aside class="cn-safety-note"><div class="cn-safety-mark">i</div><p><strong>Catatan penggunaan.</strong> Hasil analisis foto merupakan skrining awal, bukan pengganti pemeriksaan lapangan. Penggunaan pestisida atau fungisida harus mengikuti label, ketentuan yang berlaku, dan arahan petugas berwenang.</p></aside>',unsafe_allow_html=True)
 
